@@ -1,30 +1,46 @@
 import requests
 import time
-import pymongo # <-- NEW: The MongoDB library
+import pymongo
+import os
+from flask import Flask
+from threading import Thread
 
 # --- 1. CLOUD DATABASE SETUP ---
-# You will get this link when you create your free MongoDB account
-MONGO_URI = "YOUR_MONGODB_CONNECTION_STRING_HERE"
+# We use os.environ to securely load the URI from Render's secret variables
+MONGO_URI = os.environ.get("MONGO_URI", "YOUR_MONGODB_CONNECTION_STRING_HERE")
 
 # Connect to the cloud database
-client = pymongo.MongoClient(MONGO_URI)
-db = client["trading_bot"]       # Creates a database named 'trading_bot'
-collection = db["wallet"]        # Creates a collection (folder) named 'wallet'
+try:
+    client = pymongo.MongoClient(MONGO_URI)
+    db = client["trading_bot"]       
+    collection = db["wallet"]        
+except Exception as e:
+    print(f"⚠️ Database connection failed: {e}")
 
+# --- 2. THE FAKE WEB SERVER (To trick Render) ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    # This is what cron-job.org will see when it visits your site!
+    return "🤖 Trading Bot is alive and monitoring the markets!"
+
+def run_server():
+    # Render assigns a specific port to web services, we must bind to it
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- 3. BOT CORE FUNCTIONS ---
 def get_bitcoin_price():
     url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
     response = requests.get(url)
     return response.json()['bitcoin']['usd']
 
-# --- 2. NEW CLOUD LOAD/SAVE FUNCTIONS ---
 def load_wallet():
-    # Try to find the wallet in the cloud database
     wallet_data = collection.find_one({"_id": "my_wallet"})
-    
     if wallet_data:
         return wallet_data
     
-    # If no wallet exists yet (first time running), create the default one
     return {
         "_id": "my_wallet",
         "usd_balance": 10000.00,
@@ -33,50 +49,57 @@ def load_wallet():
     }
 
 def save_wallet(wallet_data):
-    # This securely updates your money in the cloud
     collection.replace_one({"_id": "my_wallet"}, wallet_data, upsert=True)
 
-# --- 3. INITIALIZE WALLET ---
-wallet = load_wallet()
+# --- 4. THE TRADING LOOP (Runs in background) ---
+def run_bot():
+    wallet = load_wallet()
+    buy_drop_threshold = 0.001   
+    sell_profit_threshold = 0.002 
 
-# --- 4. DYNAMIC TRADING RULES ---
-buy_drop_threshold = 0.001   
-sell_profit_threshold = 0.002 
+    print("🤖 Initializing Bot & Fetching Cloud Memory...")
+    print(f"💼 Loaded Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC")
+    print(f"📊 Baseline BTC Price memorized at: ${wallet['last_trade_price']}\n")
 
-print("🤖 Initializing Bot & Fetching Cloud Memory...")
-print(f"💼 Loaded Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC")
-print(f"📊 Baseline BTC Price memorized at: ${wallet['last_trade_price']}\n")
-
-while True:
-    try:
-        current_price = get_bitcoin_price()
-        price_change = (current_price - wallet['last_trade_price']) / wallet['last_trade_price']
-        
-        print(f"📈 Current Price: ${current_price} | Change: {price_change*100:.3f}%")
-
-        # --- THE BUY LOGIC ---
-        if wallet['usd_balance'] > 0 and price_change <= -buy_drop_threshold:
-            print(f"🚨 PRICE DROPPED {abs(price_change)*100:.2f}%! Buying Bitcoin at ${current_price}...")
+    while True:
+        try:
+            current_price = get_bitcoin_price()
+            price_change = (current_price - wallet['last_trade_price']) / wallet['last_trade_price']
             
-            wallet['btc_balance'] = wallet['usd_balance'] / current_price 
-            wallet['usd_balance'] = 0.00 
-            wallet['last_trade_price'] = current_price 
-            
-            save_wallet(wallet) # <-- SAVES TO THE CLOUD
-            print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
+            print(f"📈 Current Price: ${current_price} | Change: {price_change*100:.3f}%")
 
-        # --- THE SELL LOGIC ---
-        elif wallet['btc_balance'] > 0 and price_change >= sell_profit_threshold:
-            print(f"🚀 PROFIT TARGET REACHED (+{price_change*100:.2f}%)! Selling Bitcoin at ${current_price}...")
-            
-            wallet['usd_balance'] = wallet['btc_balance'] * current_price 
-            wallet['btc_balance'] = 0.00 
-            wallet['last_trade_price'] = current_price 
-            
-            save_wallet(wallet) # <-- SAVES TO THE CLOUD
-            print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
+            # --- THE BUY LOGIC ---
+            if wallet['usd_balance'] > 0 and price_change <= -buy_drop_threshold:
+                print(f"🚨 PRICE DROPPED {abs(price_change)*100:.2f}%! Buying Bitcoin at ${current_price}...")
+                
+                wallet['btc_balance'] = wallet['usd_balance'] / current_price 
+                wallet['usd_balance'] = 0.00 
+                wallet['last_trade_price'] = current_price 
+                
+                save_wallet(wallet) 
+                print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
 
-    except Exception as e:
-        print(f"⚠️ Error: {e}")
+            # --- THE SELL LOGIC ---
+            elif wallet['btc_balance'] > 0 and price_change >= sell_profit_threshold:
+                print(f"🚀 PROFIT TARGET REACHED (+{price_change*100:.2f}%)! Selling Bitcoin at ${current_price}...")
+                
+                wallet['usd_balance'] = wallet['btc_balance'] * current_price 
+                wallet['btc_balance'] = 0.00 
+                wallet['last_trade_price'] = current_price 
+                
+                save_wallet(wallet) 
+                print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
 
-    time.sleep(60)
+        except Exception as e:
+            print(f"⚠️ Error: {e}")
+
+        time.sleep(60)
+
+# --- 5. EXECUTION ---
+if __name__ == "__main__":
+    # 1. Start the trading bot in a separate background thread
+    bot_thread = Thread(target=run_bot)
+    bot_thread.start()
+    
+    # 2. Start the fake web server on the main thread
+    run_server()
