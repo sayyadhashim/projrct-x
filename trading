@@ -1,0 +1,82 @@
+import requests
+import time
+import pymongo # <-- NEW: The MongoDB library
+
+# --- 1. CLOUD DATABASE SETUP ---
+# You will get this link when you create your free MongoDB account
+MONGO_URI = "YOUR_MONGODB_CONNECTION_STRING_HERE"
+
+# Connect to the cloud database
+client = pymongo.MongoClient(MONGO_URI)
+db = client["trading_bot"]       # Creates a database named 'trading_bot'
+collection = db["wallet"]        # Creates a collection (folder) named 'wallet'
+
+def get_bitcoin_price():
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+    response = requests.get(url)
+    return response.json()['bitcoin']['usd']
+
+# --- 2. NEW CLOUD LOAD/SAVE FUNCTIONS ---
+def load_wallet():
+    # Try to find the wallet in the cloud database
+    wallet_data = collection.find_one({"_id": "my_wallet"})
+    
+    if wallet_data:
+        return wallet_data
+    
+    # If no wallet exists yet (first time running), create the default one
+    return {
+        "_id": "my_wallet",
+        "usd_balance": 10000.00,
+        "btc_balance": 0.00,
+        "last_trade_price": get_bitcoin_price()
+    }
+
+def save_wallet(wallet_data):
+    # This securely updates your money in the cloud
+    collection.replace_one({"_id": "my_wallet"}, wallet_data, upsert=True)
+
+# --- 3. INITIALIZE WALLET ---
+wallet = load_wallet()
+
+# --- 4. DYNAMIC TRADING RULES ---
+buy_drop_threshold = 0.001   
+sell_profit_threshold = 0.002 
+
+print("🤖 Initializing Bot & Fetching Cloud Memory...")
+print(f"💼 Loaded Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC")
+print(f"📊 Baseline BTC Price memorized at: ${wallet['last_trade_price']}\n")
+
+while True:
+    try:
+        current_price = get_bitcoin_price()
+        price_change = (current_price - wallet['last_trade_price']) / wallet['last_trade_price']
+        
+        print(f"📈 Current Price: ${current_price} | Change: {price_change*100:.3f}%")
+
+        # --- THE BUY LOGIC ---
+        if wallet['usd_balance'] > 0 and price_change <= -buy_drop_threshold:
+            print(f"🚨 PRICE DROPPED {abs(price_change)*100:.2f}%! Buying Bitcoin at ${current_price}...")
+            
+            wallet['btc_balance'] = wallet['usd_balance'] / current_price 
+            wallet['usd_balance'] = 0.00 
+            wallet['last_trade_price'] = current_price 
+            
+            save_wallet(wallet) # <-- SAVES TO THE CLOUD
+            print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
+
+        # --- THE SELL LOGIC ---
+        elif wallet['btc_balance'] > 0 and price_change >= sell_profit_threshold:
+            print(f"🚀 PROFIT TARGET REACHED (+{price_change*100:.2f}%)! Selling Bitcoin at ${current_price}...")
+            
+            wallet['usd_balance'] = wallet['btc_balance'] * current_price 
+            wallet['btc_balance'] = 0.00 
+            wallet['last_trade_price'] = current_price 
+            
+            save_wallet(wallet) # <-- SAVES TO THE CLOUD
+            print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
+
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
+
+    time.sleep(60)
