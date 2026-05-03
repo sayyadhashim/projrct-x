@@ -1,105 +1,281 @@
-import requests
-import time
-import pymongo
+"""
+alpaca_bot.py — Alpaca Paper Trading Bot
+Polls Render /signal endpoint and places bracket orders on Alpaca Paper.
+⚠️  KEEP THIS FILE PRIVATE. Never upload to GitHub.
+"""
+
 import os
-from flask import Flask
-from threading import Thread
+import re
+import time
+import requests
+import pytz
+from datetime import datetime
+from logzero import logger
 
-# --- 1. CLOUD DATABASE SETUP ---
-# We use os.environ to securely load the URI from Render's secret variables
-MONGO_URI = os.environ.get("MONGO_URI", "YOUR_MONGODB_CONNECTION_STRING_HERE")
+import alpaca_trade_api as tradeapi
+from alpaca_trade_api.rest import APIError
 
-# Connect to the cloud database
-try:
-    client = pymongo.MongoClient(MONGO_URI)
-    db = client["trading_bot"]       
-    collection = db["wallet"]        
-except Exception as e:
-    print(f"⚠️ Database connection failed: {e}")
+# =============================================================================
+# YOUR CREDENTIALS
+# =============================================================================
+ALPACA_API_KEY    = "PK6NVB35BQLWSQH5M5MDNKVDF2"
+ALPACA_SECRET_KEY = "2q2Mjk1opq56a73gqciurnvR3YsP7NvLAGTXScZ2nZjb"
+ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"
 
-# --- 2. THE FAKE WEB SERVER (To trick Render) ---
-app = Flask(__name__)
+RENDER_URL        = os.environ.get("RENDER_URL", "https://your-app.onrender.com")
+SIGNAL_URL        = f"{RENDER_URL}/signal"
 
-@app.route('/')
-def home():
-    # This is what cron-job.org will see when it visits your site!
-    return "🤖 Trading Bot is alive and monitoring the markets!"
+POLL_INTERVAL     = 60      # seconds between checks
+MIN_PROB          = 60.0    # skip signals below this %
+QTY               = 1       # shares per trade
 
-def run_server():
-    # Render assigns a specific port to web services, we must bind to it
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+# NSE → US stock mapping (only stocks with US listings)
+NSE_TO_US = {
+    "INFY":      "INFY",   # Infosys — NYSE
+    "WIPRO":     "WIT",    # Wipro — NYSE
+    "HDFCBANK":  "HDB",    # HDFC Bank — NYSE
+    "ICICIBANK": "IBN",    # ICICI Bank — NYSE
+    "SBIN":      None,     # No US listing
+    "TCS":       None,     # No US listing
+    "RELIANCE":  None,     # No US listing
+    "TMPV":      None,
+    "TMCV":      None,
+}
 
-# --- 3. BOT CORE FUNCTIONS ---
-def get_bitcoin_price():
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-    response = requests.get(url)
-    return response.json()['bitcoin']['usd']
+IST = pytz.timezone("Asia/Kolkata")
+EST = pytz.timezone("US/Eastern")
 
-def load_wallet():
-    wallet_data = collection.find_one({"_id": "my_wallet"})
-    if wallet_data:
-        return wallet_data
-    
-    return {
-        "_id": "my_wallet",
-        "usd_balance": 10000.00,
-        "btc_balance": 0.00,
-        "last_trade_price": get_bitcoin_price()
-    }
+# =============================================================================
+# SIGNAL PARSER
+# =============================================================================
+def parse_signal(text):
+    try:
+        direction = "LONG" if "LONG" in text.upper() else "SHORT"
+        sym_m  = re.search(r'ALERT:\s*([A-Z]+(?:\.[A-Z]+)?)', text, re.IGNORECASE)
+        entry_m= re.search(r'Entry:\s*([\d.]+)', text)
+        sl_m   = re.search(r'Stop Loss:\s*([\d.]+)', text)
+        tp_m   = re.search(r'Target.*?:\s*([\d.]+)', text)
+        prob_m = re.search(r'Markov Prob:\s*([\d.]+)', text)
 
-def save_wallet(wallet_data):
-    collection.replace_one({"_id": "my_wallet"}, wallet_data, upsert=True)
+        if not all([sym_m, entry_m, sl_m, tp_m, prob_m]):
+            return None
 
-# --- 4. THE TRADING LOOP (Runs in background) ---
-def run_bot():
-    wallet = load_wallet()
-    buy_drop_threshold = 0.001   
-    sell_profit_threshold = 0.002 
+        nse_sym = sym_m.group(1).replace(".NS","").replace(".BSE","").upper()
+        us_sym  = NSE_TO_US.get(nse_sym)
 
-    print("🤖 Initializing Bot & Fetching Cloud Memory...")
-    print(f"💼 Loaded Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC")
-    print(f"📊 Baseline BTC Price memorized at: ${wallet['last_trade_price']}\n")
+        return {
+            "nse_symbol": nse_sym,
+            "us_symbol":  us_sym,
+            "direction":  direction,
+            "entry":      float(entry_m.group(1)),
+            "sl":         float(sl_m.group(1)),
+            "tp":         float(tp_m.group(1)),
+            "prob":       float(prob_m.group(1)),
+        }
+    except Exception as e:
+        logger.error(f"Parse error: {e}")
+        return None
+
+# =============================================================================
+# ALPACA HELPERS
+# =============================================================================
+def connect_alpaca():
+    api = tradeapi.REST(
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+        ALPACA_BASE_URL,
+        api_version='v2'
+    )
+    account = api.get_account()
+    logger.info(f"✅ Alpaca Paper connected")
+    logger.info(f"   Cash      : ${float(account.cash):,.2f}")
+    logger.info(f"   Portfolio : ${float(account.portfolio_value):,.2f}")
+    return api
+
+
+def is_market_open(api):
+    return api.get_clock().is_open
+
+
+def get_current_price(api, symbol):
+    try:
+        bar = api.get_latest_bar(symbol)
+        return float(bar.c)
+    except Exception as e:
+        logger.error(f"Price error {symbol}: {e}")
+        return None
+
+
+def get_open_positions(api):
+    try:
+        return {p.symbol: p for p in api.list_positions()}
+    except Exception:
+        return {}
+
+
+def place_bracket_order(api, signal):
+    us_sym    = signal["us_symbol"]
+    direction = signal["direction"]
+    entry_nse = signal["entry"]
+    sl_nse    = signal["sl"]
+    tp_nse    = signal["tp"]
+
+    if not us_sym:
+        logger.warning(f"No US symbol for {signal['nse_symbol']}. Skipping.")
+        return None
+
+    # Get current US price
+    current_price = get_current_price(api, us_sym)
+    if not current_price:
+        logger.error(f"Cannot get price for {us_sym}. Skipping.")
+        return None
+
+    # Convert SL/TP as % offsets from NSE signal → apply to US price
+    sl_pct = abs(entry_nse - sl_nse) / entry_nse
+    tp_pct = abs(tp_nse   - entry_nse) / entry_nse
+
+    if direction == "LONG":
+        us_sl = round(current_price * (1 - sl_pct), 2)
+        us_tp = round(current_price * (1 + tp_pct), 2)
+        side  = "buy"
+    else:
+        us_sl = round(current_price * (1 + sl_pct), 2)
+        us_tp = round(current_price * (1 - tp_pct), 2)
+        side  = "sell"
+
+    logger.info(
+        f"📤 {side.upper()} {us_sym} x{QTY}\n"
+        f"   US Price : ${current_price:.2f}\n"
+        f"   SL       : ${us_sl:.2f}\n"
+        f"   TP       : ${us_tp:.2f}"
+    )
+
+    try:
+        order = api.submit_order(
+            symbol        = us_sym,
+            qty           = QTY,
+            side          = side,
+            type          = "market",
+            time_in_force = "day",
+            order_class   = "bracket",
+            stop_loss     = {"stop_price": str(us_sl)},
+            take_profit   = {"limit_price": str(us_tp)},
+        )
+        logger.info(f"✅ Order placed: {order.id}")
+        return order.id
+    except APIError as e:
+        logger.error(f"❌ Order failed: {e}")
+        return None
+
+
+def print_summary(api):
+    acc = api.get_account()
+    pnl = float(acc.equity) - float(acc.last_equity)
+    positions = api.list_positions()
+    logger.info("─" * 45)
+    logger.info(f"💰 Cash: ${float(acc.cash):,.2f} | P&L today: ${pnl:+,.2f}")
+    for p in positions:
+        logger.info(f"   {p.symbol}: {p.qty} shares | P&L: ${float(p.unrealized_pl):+.2f}")
+    logger.info("─" * 45)
+
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+def run():
+    logger.info("🤖 Alpaca Paper Bot starting...")
+    logger.info(f"   Base URL  : {ALPACA_BASE_URL}")
+    logger.info(f"   Signal URL: {SIGNAL_URL}")
+
+    api = connect_alpaca()
+
+    last_signal  = None
+    placed_today = set()
 
     while True:
         try:
-            current_price = get_bitcoin_price()
-            price_change = (current_price - wallet['last_trade_price']) / wallet['last_trade_price']
-            
-            print(f"📈 Current Price: ${current_price} | Change: {price_change*100:.3f}%")
+            now_est = datetime.now(EST)
 
-            # --- THE BUY LOGIC ---
-            if wallet['usd_balance'] > 0 and price_change <= -buy_drop_threshold:
-                print(f"🚨 PRICE DROPPED {abs(price_change)*100:.2f}%! Buying Bitcoin at ${current_price}...")
-                
-                wallet['btc_balance'] = wallet['usd_balance'] / current_price 
-                wallet['usd_balance'] = 0.00 
-                wallet['last_trade_price'] = current_price 
-                
-                save_wallet(wallet) 
-                print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
+            # Reset daily tracking at 4 PM EST (market close)
+            if now_est.hour == 16 and now_est.minute == 0:
+                placed_today.clear()
+                logger.info("🔄 Daily tracking reset")
 
-            # --- THE SELL LOGIC ---
-            elif wallet['btc_balance'] > 0 and price_change >= sell_profit_threshold:
-                print(f"🚀 PROFIT TARGET REACHED (+{price_change*100:.2f}%)! Selling Bitcoin at ${current_price}...")
-                
-                wallet['usd_balance'] = wallet['btc_balance'] * current_price 
-                wallet['btc_balance'] = 0.00 
-                wallet['last_trade_price'] = current_price 
-                
-                save_wallet(wallet) 
-                print(f"☁️ Saved to MongoDB! Balance: ${wallet['usd_balance']:.2f} USD | {wallet['btc_balance']:.6f} BTC\n")
+            # Check market hours
+            if not is_market_open(api):
+                nxt = api.get_clock().next_open
+                logger.info(f"⏸  US Market closed. Next open: {nxt}")
+                time.sleep(300)
+                continue
+
+            # Fetch signal
+            try:
+                res = requests.get(SIGNAL_URL, timeout=10)
+                data = res.json()
+            except Exception as e:
+                logger.error(f"Render fetch error: {e}")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            raw = data.get("signal", "").strip()
+            if not raw or raw == last_signal:
+                logger.debug("No new signal.")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            logger.info(f"📡 New signal:\n{raw}")
+            signal = parse_signal(raw)
+            if not signal:
+                last_signal = raw
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            logger.info(f"   {signal['nse_symbol']} → {signal['us_symbol']} | {signal['direction']} | Prob: {signal['prob']}%")
+
+            # Probability filter
+            if signal["prob"] < MIN_PROB:
+                logger.warning(f"Prob {signal['prob']}% below {MIN_PROB}%. Skipping.")
+                last_signal = raw
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            us_sym = signal["us_symbol"]
+            if not us_sym:
+                logger.warning(f"No US equivalent for {signal['nse_symbol']}. Skipping.")
+                last_signal = raw
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # Already traded today?
+            if us_sym in placed_today:
+                logger.info(f"{us_sym} already traded today. Skipping.")
+                last_signal = raw
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # Already in position?
+            if us_sym in get_open_positions(api):
+                logger.info(f"{us_sym} already open. Skipping.")
+                last_signal = raw
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # Place order
+            order_id = place_bracket_order(api, signal)
+            if order_id:
+                placed_today.add(us_sym)
+                print_summary(api)
+
+            last_signal = raw
 
         except Exception as e:
-            print(f"⚠️ Error: {e}")
+            logger.error(f"Bot error: {e}")
+            try:
+                api = connect_alpaca()
+            except Exception:
+                pass
 
-        time.sleep(60)
+        time.sleep(POLL_INTERVAL)
 
-# --- 5. EXECUTION ---
+
 if __name__ == "__main__":
-    # 1. Start the trading bot in a separate background thread
-    bot_thread = Thread(target=run_bot)
-    bot_thread.start()
-    
-    # 2. Start the fake web server on the main thread
-    run_server()
+    run()
