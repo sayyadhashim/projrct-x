@@ -1,4 +1,8 @@
-alpaca-trade-api
+yfinance
+pandas
+numpy
 requests
 pytz
-logzero
+alpaca-trade-api
+websocket-client
+urllib3
