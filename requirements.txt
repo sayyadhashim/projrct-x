@@ -1,3 +1,4 @@
+alpaca-trade-api
 requests
-pymongo
-flask
+pytz
+logzero
