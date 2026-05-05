@@ -65,8 +65,8 @@ MARKET_END      = '15:30'  # Stop 30 min before US close
 EOD_CLOSE       = '15:45'  # Force close all at this time EST
 
 # ── Alpaca Credentials ────────────────────────────────────────────────────────
-ALPACA_API_KEY    = "PKZSURSPQMHEPNSASV366KOVY7"
-ALPACA_SECRET_KEY = "BRSyrb3TJDw2u5zzaZtkvEBZqG3GUoBro1Ye82GskJux"
+ALPACA_API_KEY    = "PKLHKP2BJMCAOYWONVSHANDZV5"
+ALPACA_SECRET_KEY = "GtxsSeUzRHALEMiL13JQSxM9W6xWRAeQVYYSzpY9tovT"
 ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"
 QTY               = int(os.environ.get("TRADE_QTY", "1"))
 
@@ -228,10 +228,10 @@ def check_alpaca_positions():
         return
     try:
         # Get all closed orders from today
+        # Note: removed 'nested' arg — not supported in all SDK versions
         orders = alpaca_api.list_orders(
             status='closed',
-            limit=50,
-            nested=True
+            limit=50
         )
         for order in orders:
             sym = order.symbol
